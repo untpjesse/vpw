@@ -22,7 +22,7 @@ export default function App() {
   const [dtcDetails, setDtcDetails] = useState<Record<string, any>>({});
   const [ecus, setEcus] = useState<{id: string, name: string, status: string, protocol: string}[]>([]);
   const [isScanningEcus, setIsScanningEcus] = useState(false);
-  const [liveData, setLiveData] = useState<any>({ rpm: 0, speed: 0, coolantTemp: 0, throttle: 0, voltage: 0 });
+  const [liveData, setLiveData] = useState<any>({ rpm: 0, speed: 0, coolantTemp: 0, throttle: 0, voltage: 0, scpErrors: 0, busLoad: 0, pwmDutyCycle: 0 });
   const [liveDataHistory, setLiveDataHistory] = useState<any[]>([]);
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalLog, setTerminalLog] = useState<{type: 'tx'|'rx'|'sys', msg: string}[]>([]);
@@ -44,6 +44,9 @@ export default function App() {
   const [activeTestState, setActiveTestState] = useState<Record<string, boolean>>({});
   const [serviceActionStatus, setServiceActionStatus] = useState<Record<string, 'idle'|'running'|'success'>>({});
   const [terminalProtocol, setTerminalProtocol] = useState('ISO15765');
+  const [connectionMode, setConnectionMode] = useState<'simulator' | 'local_bridge'>('simulator');
+  const [bridgeStatus, setBridgeStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+  const wsRef = useRef<WebSocket | null>(null);
 
   const fetchDevices = () => {
     fetch('/api/devices')
@@ -155,6 +158,60 @@ export default function App() {
     const protocol = deviceProtocols[id] || 'ISO15765';
     const baudRate = deviceBaudRates[id] || '500000';
     const pins = devicePins[id] || '6/14';
+    
+    if (connectionMode === 'local_bridge') {
+      setBridgeStatus('connecting');
+      addToTerminal('sys', `Attempting to connect to local hardware bridge at ws://127.0.0.1:8080...`);
+      
+      try {
+        const ws = new WebSocket('ws://127.0.0.1:8080');
+        ws.onopen = () => {
+          setBridgeStatus('connected');
+          ws.send(JSON.stringify({ action: 'connect', protocol, baudRate, pins }));
+          
+          // Still register with backend simulator for UI state
+          fetch(`/api/devices/${id}/connect`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ protocol, baudRate, pins })
+          }).then(() => {
+            fetchDevices();
+            checkStatus();
+            addToTerminal('sys', `Connected to physical VCX Nano via bridge (${protocol})`);
+          });
+        };
+        
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.action === 'send' && data.received) {
+              addToTerminal('rx', data.received);
+            } else if (data.action === 'connect') {
+              addToTerminal('sys', `Bridge: ${data.message}`);
+            }
+          } catch (e) {
+            console.error("Invalid WS message", e);
+          }
+        };
+        
+        ws.onerror = () => {
+          setBridgeStatus('disconnected');
+          addToTerminal('sys', `Failed to connect to local bridge. Is the Python script running?`);
+        };
+        
+        ws.onclose = () => {
+          setBridgeStatus('disconnected');
+          addToTerminal('sys', `Disconnected from local bridge.`);
+        };
+        
+        wsRef.current = ws;
+      } catch (err) {
+        setBridgeStatus('disconnected');
+        addToTerminal('sys', `WebSocket error: ${err}`);
+      }
+      return;
+    }
+
     fetch(`/api/devices/${id}/connect`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -173,6 +230,13 @@ export default function App() {
   };
 
   const disconnectDevice = (id: string) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ action: 'disconnect' }));
+      wsRef.current.close();
+      wsRef.current = null;
+      setBridgeStatus('disconnected');
+    }
+
     fetch(`/api/devices/${id}/disconnect`, { method: 'POST' })
       .then(res => res.json())
       .then(data => {
@@ -260,6 +324,11 @@ export default function App() {
     const msg = terminalInput.trim().toUpperCase();
     addToTerminal('tx', msg);
     setTerminalInput('');
+
+    if (connectionMode === 'local_bridge' && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ action: 'send', message: msg }));
+      return;
+    }
 
     fetch('/api/send', {
       method: 'POST',
@@ -358,18 +427,25 @@ export default function App() {
     addToTerminal('sys', `Active Test [${testId}]: Commanded ${newState ? customOn : customOff}`);
   };
 
-  const runServiceAction = (actionId: string) => {
+  const runServiceAction = async (actionId: string) => {
     setServiceActionStatus(prev => ({ ...prev, [actionId]: 'running' }));
     addToTerminal('sys', `Service Action [${actionId}]: Initiated...`);
     
-    setTimeout(() => {
+    try {
+      const res = await fetch(`/api/service/${actionId}`, { method: 'POST' });
+      if (!res.ok) throw new Error('Service action failed');
+      const data = await res.json();
+      
       setServiceActionStatus(prev => ({ ...prev, [actionId]: 'success' }));
-      addToTerminal('sys', `Service Action [${actionId}]: Completed successfully.`);
+      addToTerminal('sys', `Service Action [${actionId}]: ${data.message || 'Completed successfully.'}`);
       
       setTimeout(() => {
         setServiceActionStatus(prev => ({ ...prev, [actionId]: 'idle' }));
       }, 3000);
-    }, 2000);
+    } catch (error) {
+      setServiceActionStatus(prev => ({ ...prev, [actionId]: 'idle' }));
+      addToTerminal('sys', `Service Action [${actionId}]: Failed.`);
+    }
   };
 
   const runBcmAction = (action: string, duration: number = 3000) => {
@@ -526,6 +602,62 @@ export default function App() {
                   </CardContent>
                 </Card>
               )}
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Connection Mode</CardTitle>
+                  <CardDescription>Choose how the application connects to vehicle hardware.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="flex flex-col space-y-4">
+                    <div className="flex items-center space-x-4">
+                      <div 
+                        className={`flex-1 p-4 border rounded-xl cursor-pointer transition-all ${connectionMode === 'simulator' ? 'border-blue-500 bg-blue-50/50 ring-1 ring-blue-500' : 'hover:bg-zinc-50'}`}
+                        onClick={() => !status.isConnected && setConnectionMode('simulator')}
+                      >
+                        <div className="flex items-center mb-2">
+                          <div className={`p-2 rounded-lg mr-3 ${connectionMode === 'simulator' ? 'bg-blue-100 text-blue-600' : 'bg-zinc-100 text-zinc-500'}`}>
+                            <Cpu className="w-5 h-5" />
+                          </div>
+                          <h3 className="font-semibold text-zinc-900">Cloud Simulator</h3>
+                        </div>
+                        <p className="text-sm text-zinc-500">Connects to a simulated vehicle network hosted in the cloud. Perfect for testing and development.</p>
+                      </div>
+                      
+                      <div 
+                        className={`flex-1 p-4 border rounded-xl cursor-pointer transition-all ${connectionMode === 'local_bridge' ? 'border-blue-500 bg-blue-50/50 ring-1 ring-blue-500' : 'hover:bg-zinc-50'}`}
+                        onClick={() => !status.isConnected && setConnectionMode('local_bridge')}
+                      >
+                        <div className="flex items-center mb-2">
+                          <div className={`p-2 rounded-lg mr-3 ${connectionMode === 'local_bridge' ? 'bg-blue-100 text-blue-600' : 'bg-zinc-100 text-zinc-500'}`}>
+                            <HardDrive className="w-5 h-5" />
+                          </div>
+                          <h3 className="font-semibold text-zinc-900">Local Hardware Bridge (VCX Nano)</h3>
+                        </div>
+                        <p className="text-sm text-zinc-500">Connects to a physical J2534 device (like VCX Nano) via a local WebSocket bridge running on your PC.</p>
+                      </div>
+                    </div>
+                    
+                    {connectionMode === 'local_bridge' && (
+                      <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
+                        <div className="flex items-start">
+                          <AlertTriangle className="w-5 h-5 mr-2 text-amber-600 flex-shrink-0 mt-0.5" />
+                          <div>
+                            <p className="font-semibold mb-1">Local Bridge Required</p>
+                            <p className="mb-2">To use physical hardware, you must run the local bridge script on your Windows PC. The web app cannot directly access your USB ports.</p>
+                            <div className="flex items-center space-x-2">
+                              <span className="font-mono bg-amber-100 px-2 py-1 rounded text-xs">ws://127.0.0.1:8080</span>
+                              <span className={`px-2 py-1 rounded text-xs font-medium ${bridgeStatus === 'connected' ? 'bg-green-100 text-green-700' : bridgeStatus === 'connecting' ? 'bg-blue-100 text-blue-700' : 'bg-zinc-200 text-zinc-700'}`}>
+                                {bridgeStatus === 'connected' ? 'Bridge Connected' : bridgeStatus === 'connecting' ? 'Connecting...' : 'Bridge Disconnected'}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
 
               <Card>
                 <CardHeader>
@@ -887,6 +1019,29 @@ export default function App() {
                         <div className="text-3xl font-mono">{liveData.voltage} <span className="text-lg text-zinc-400">V</span></div>
                       </CardContent>
                     </Card>
+                    
+                    {status.activeProtocol === 'J1850PWM' && (
+                      <>
+                        <Card className="border-teal-900/20 bg-teal-50/30">
+                          <CardContent className="p-6">
+                            <div className="text-sm text-teal-700 mb-1 font-medium">SCP Bus Errors</div>
+                            <div className="text-3xl font-mono text-teal-900">{liveData.scpErrors}</div>
+                          </CardContent>
+                        </Card>
+                        <Card className="border-teal-900/20 bg-teal-50/30">
+                          <CardContent className="p-6">
+                            <div className="text-sm text-teal-700 mb-1 font-medium">SCP Bus Load</div>
+                            <div className="text-3xl font-mono text-teal-900">{liveData.busLoad} <span className="text-lg text-teal-700/70">%</span></div>
+                          </CardContent>
+                        </Card>
+                        <Card className="border-teal-900/20 bg-teal-50/30">
+                          <CardContent className="p-6">
+                            <div className="text-sm text-teal-700 mb-1 font-medium">PWM Duty Cycle</div>
+                            <div className="text-3xl font-mono text-teal-900">{liveData.pwmDutyCycle} <span className="text-lg text-teal-700/70">%</span></div>
+                          </CardContent>
+                        </Card>
+                      </>
+                    )}
                   </div>
 
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -924,6 +1079,27 @@ export default function App() {
                       </CardContent>
                     </Card>
                   </div>
+
+                  {status.activeProtocol === 'J1850PWM' && (
+                    <div className="grid grid-cols-1 gap-6 mt-6">
+                      <Card>
+                        <CardHeader>
+                          <CardTitle>SCP Bus Load History</CardTitle>
+                        </CardHeader>
+                        <CardContent className="h-72">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <LineChart data={liveDataHistory}>
+                              <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                              <XAxis dataKey="time" hide />
+                              <YAxis domain={[0, 100]} label={{ value: 'Load (%)', angle: -90, position: 'insideLeft', style: { textAnchor: 'middle' } }} />
+                              <Tooltip />
+                              <Line type="monotone" dataKey="busLoad" stroke="#0f766e" strokeWidth={2} dot={false} isAnimationActive={false} />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        </CardContent>
+                      </Card>
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -1331,6 +1507,43 @@ export default function App() {
                           {activeTestState['horn'] ? 'ON' : 'OFF'}
                         </Button>
                       </div>
+
+                      {status.activeProtocol === 'J1850PWM' && (
+                        <>
+                          <div className="flex items-center justify-between p-3 border rounded-lg bg-teal-50/30 border-teal-100">
+                            <div className="flex items-center space-x-3">
+                              <Activity className="w-5 h-5 text-teal-600" />
+                              <div>
+                                <p className="font-medium text-sm text-teal-900">EGR Vacuum Regulator</p>
+                                <p className="text-xs text-teal-700/70">Command EVR duty cycle</p>
+                              </div>
+                            </div>
+                            <Button 
+                              variant={activeTestState['evr'] ? 'default' : 'outline'}
+                              className={activeTestState['evr'] ? 'bg-teal-600 text-white hover:bg-teal-700' : 'border-teal-200 text-teal-700 hover:bg-teal-50'}
+                              onClick={() => toggleActiveTest('evr')}
+                            >
+                              {activeTestState['evr'] ? 'ON' : 'OFF'}
+                            </Button>
+                          </div>
+                          <div className="flex items-center justify-between p-3 border rounded-lg bg-teal-50/30 border-teal-100">
+                            <div className="flex items-center space-x-3">
+                              <Wind className="w-5 h-5 text-teal-600" />
+                              <div>
+                                <p className="font-medium text-sm text-teal-900">Idle Air Control</p>
+                                <p className="text-xs text-teal-700/70">Command IAC duty cycle</p>
+                              </div>
+                            </div>
+                            <Button 
+                              variant={activeTestState['iac'] ? 'default' : 'outline'}
+                              className={activeTestState['iac'] ? 'bg-teal-600 text-white hover:bg-teal-700' : 'border-teal-200 text-teal-700 hover:bg-teal-50'}
+                              onClick={() => toggleActiveTest('iac')}
+                            >
+                              {activeTestState['iac'] ? 'ON' : 'OFF'}
+                            </Button>
+                          </div>
+                        </>
+                      )}
                     </CardContent>
                   </Card>
 
@@ -1840,6 +2053,90 @@ export default function App() {
                         >
                           {serviceActionStatus['trans_learn'] === 'running' ? <RefreshCw className="w-4 h-4 animate-spin" /> : 
                            serviceActionStatus['trans_learn'] === 'success' ? <><CheckCircle2 className="w-4 h-4 mr-1"/> Done</> : 'Start'}
+                        </Button>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="flex items-center"><Settings className="w-5 h-5 mr-2 text-teal-500"/> Ford SCP (J1850 PWM)</CardTitle>
+                      <CardDescription>Legacy Ford Standard Corporate Protocol functions.</CardDescription>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                      <div className="flex items-center justify-between p-3 border rounded-lg">
+                        <div className="flex items-center space-x-3">
+                          <Activity className="w-5 h-5 text-zinc-500" />
+                          <div>
+                            <p className="font-medium text-sm">KOEO Self Test</p>
+                            <p className="text-xs text-zinc-500">Key On Engine Off Diagnostics</p>
+                          </div>
+                        </div>
+                        <Button 
+                          disabled={serviceActionStatus['koeo'] === 'running'}
+                          onClick={() => runServiceAction('koeo')}
+                          variant={serviceActionStatus['koeo'] === 'success' ? 'outline' : 'default'}
+                          className={serviceActionStatus['koeo'] === 'success' ? 'text-green-600 border-green-200 bg-green-50' : ''}
+                        >
+                          {serviceActionStatus['koeo'] === 'running' ? <RefreshCw className="w-4 h-4 animate-spin" /> : 
+                           serviceActionStatus['koeo'] === 'success' ? <><CheckCircle2 className="w-4 h-4 mr-1"/> Done</> : 'Start'}
+                        </Button>
+                      </div>
+
+                      <div className="flex items-center justify-between p-3 border rounded-lg">
+                        <div className="flex items-center space-x-3">
+                          <RefreshCcw className="w-5 h-5 text-zinc-500" />
+                          <div>
+                            <p className="font-medium text-sm">KOER Self Test</p>
+                            <p className="text-xs text-zinc-500">Key On Engine Running Diagnostics</p>
+                          </div>
+                        </div>
+                        <Button 
+                          disabled={serviceActionStatus['koer'] === 'running'}
+                          onClick={() => runServiceAction('koer')}
+                          variant={serviceActionStatus['koer'] === 'success' ? 'outline' : 'default'}
+                          className={serviceActionStatus['koer'] === 'success' ? 'text-green-600 border-green-200 bg-green-50' : ''}
+                        >
+                          {serviceActionStatus['koer'] === 'running' ? <RefreshCw className="w-4 h-4 animate-spin" /> : 
+                           serviceActionStatus['koer'] === 'success' ? <><CheckCircle2 className="w-4 h-4 mr-1"/> Done</> : 'Start'}
+                        </Button>
+                      </div>
+
+                      <div className="flex items-center justify-between p-3 border rounded-lg">
+                        <div className="flex items-center space-x-3">
+                          <Shield className="w-5 h-5 text-zinc-500" />
+                          <div>
+                            <p className="font-medium text-sm">PATS Initialization</p>
+                            <p className="text-xs text-zinc-500">Passive Anti-Theft System Reset</p>
+                          </div>
+                        </div>
+                        <Button 
+                          disabled={serviceActionStatus['pats'] === 'running'}
+                          onClick={() => runServiceAction('pats')}
+                          variant={serviceActionStatus['pats'] === 'success' ? 'outline' : 'default'}
+                          className={serviceActionStatus['pats'] === 'success' ? 'text-green-600 border-green-200 bg-green-50' : ''}
+                        >
+                          {serviceActionStatus['pats'] === 'running' ? <RefreshCw className="w-4 h-4 animate-spin" /> : 
+                           serviceActionStatus['pats'] === 'success' ? <><CheckCircle2 className="w-4 h-4 mr-1"/> Done</> : 'Start'}
+                        </Button>
+                      </div>
+
+                      <div className="flex items-center justify-between p-3 border rounded-lg">
+                        <div className="flex items-center space-x-3">
+                          <Volume2 className="w-5 h-5 text-zinc-500" />
+                          <div>
+                            <p className="font-medium text-sm">Injector Buzz Test</p>
+                            <p className="text-xs text-zinc-500">Test fuel injector solenoids</p>
+                          </div>
+                        </div>
+                        <Button 
+                          disabled={serviceActionStatus['buzz'] === 'running'}
+                          onClick={() => runServiceAction('buzz')}
+                          variant={serviceActionStatus['buzz'] === 'success' ? 'outline' : 'default'}
+                          className={serviceActionStatus['buzz'] === 'success' ? 'text-green-600 border-green-200 bg-green-50' : ''}
+                        >
+                          {serviceActionStatus['buzz'] === 'running' ? <RefreshCw className="w-4 h-4 animate-spin" /> : 
+                           serviceActionStatus['buzz'] === 'success' ? <><CheckCircle2 className="w-4 h-4 mr-1"/> Done</> : 'Start'}
                         </Button>
                       </div>
                     </CardContent>
