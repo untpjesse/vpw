@@ -1,0 +1,5 @@
+{
+  "name": "J2534 Diagnostic Tool",
+  "description": "A full-stack J2534 wrapper and vehicle diagnostic tool interface.",
+  "requestFramePermissions": []
+}
