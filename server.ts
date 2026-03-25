@@ -20,9 +20,77 @@ async function startServer() {
     res.json({ devices });
   });
 
+  app.get("/api/bridge-script", (req, res) => {
+    const script = `import asyncio
+import websockets
+import json
+import time
+
+# This is a local bridge script to connect the web application
+# to your physical J2534 hardware (like Tactrix, Mongoose, VCX Nano).
+# 
+# Prerequisites:
+# 1. Install Python 3.7+
+# 2. Install websockets: pip install websockets
+# 3. Run this script: python j2534_bridge.py
+
+async def j2534_handler(websocket):
+    print("✅ Web app connected to local bridge!")
+    try:
+        async for message in websocket:
+            data = json.loads(message)
+            print(f"📥 Received from web app: {data}")
+            
+            action = data.get("action")
+            
+            if action == "connect":
+                protocol = data.get("protocol", "ISO15765")
+                baud = data.get("baudRate", "500000")
+                print(f"🔌 Connecting to J2534 hardware (Protocol: {protocol}, Baud: {baud})...")
+                
+                # TODO: Initialize your J2534 DLL here (e.g., using ctypes)
+                # PassThruOpen(), PassThruConnect()
+                
+                await asyncio.sleep(0.5) # Simulate connection delay
+                await websocket.send(json.dumps({"success": True, "message": "Connected to physical hardware"}))
+                
+            elif action == "send":
+                msg = data.get("message", "")
+                print(f"🚗 Sending to vehicle: {msg}")
+                
+                # TODO: Send message via J2534 DLL
+                # PassThruWriteMsgs(), PassThruReadMsgs()
+                
+                # Mock response for testing the bridge
+                await asyncio.sleep(0.1)
+                await websocket.send(json.dumps({"success": True, "received": "41 00 BF 9F E9 91"}))
+                
+            elif action == "disconnect":
+                print("🔌 Disconnecting from hardware...")
+                # TODO: PassThruDisconnect(), PassThruClose()
+                await websocket.send(json.dumps({"success": True, "message": "Disconnected"}))
+                
+    except websockets.exceptions.ConnectionClosed:
+        print("❌ Web app disconnected.")
+
+async def main():
+    print("🚀 J2534 Local Bridge Server starting...")
+    print("📡 Listening on ws://127.0.0.1:8080")
+    print("⏳ Waiting for web app to connect...")
+    async with websockets.serve(j2534_handler, "127.0.0.1", 8080):
+        await asyncio.Future()  # run forever
+
+if __name__ == "__main__":
+    asyncio.run(main())
+`;
+    res.setHeader('Content-Disposition', 'attachment; filename="j2534_bridge.py"');
+    res.setHeader('Content-Type', 'text/plain');
+    res.send(script);
+  });
+
   app.post("/api/devices", (req, res) => {
     const { name, connectionType, protocol } = req.body;
-    if (!name || !connectionType) return res.status(400).json({ error: "Missing name or connectionType" });
+    if (!name || typeof name !== 'string' || !connectionType) return res.status(400).json({ error: "Missing name or connectionType" });
     const newDevice = {
       id: name.toLowerCase().replace(/\s+/g, '-') + '-' + Date.now(),
       name,
@@ -206,6 +274,7 @@ async function startServer() {
     const activeDevice = devices.find(d => d.isConnected);
     if (!activeDevice) return res.status(400).json({ error: "Not connected to a vehicle" });
     const { message } = req.body;
+    if (!message || typeof message !== 'string') return res.status(400).json({ error: "Missing or invalid message" });
     
     let received = "41 00 BF 9F E9 91"; // Default mock response
     

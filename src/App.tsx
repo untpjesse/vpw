@@ -75,7 +75,8 @@ export default function App() {
           });
           return pins;
         });
-      });
+      })
+      .catch(err => console.error("Failed to fetch devices:", err));
   };
 
   useEffect(() => {
@@ -97,7 +98,8 @@ export default function App() {
           checkStatus();
           setTerminalLog(prev => [...prev, { type: 'sys', msg: `Auto-connected to last known device via ${lastProtocol}` }]);
         }
-      });
+      })
+      .catch(err => console.error("Failed to auto-connect:", err));
     }
   }, []);
 
@@ -115,7 +117,8 @@ export default function App() {
                 return newHistory.slice(-20); // Keep last 20 points
               });
             }
-          });
+          })
+          .catch(err => console.error("Failed to fetch live data:", err));
       }, 1000);
     }
     return () => clearInterval(interval);
@@ -124,7 +127,8 @@ export default function App() {
   const checkStatus = () => {
     fetch('/api/status')
       .then(res => res.json())
-      .then(data => setStatus(data));
+      .then(data => setStatus(data))
+      .catch(err => console.error("Failed to fetch status:", err));
   };
 
   const addDevice = (e: React.FormEvent) => {
@@ -142,7 +146,8 @@ export default function App() {
         fetchDevices();
         addToTerminal('sys', `Added new device: ${data.device.name}`);
       }
-    });
+    })
+    .catch(err => console.error("Failed to add device:", err));
   };
 
   const updateDeviceProtocol = (id: string, protocol: string) => {
@@ -151,7 +156,7 @@ export default function App() {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ protocol })
-    });
+    }).catch(err => console.error("Failed to update protocol:", err));
   };
 
   const connectDevice = (id: string) => {
@@ -178,7 +183,7 @@ export default function App() {
             fetchDevices();
             checkStatus();
             addToTerminal('sys', `Connected to physical VCX Nano via bridge (${protocol})`);
-          });
+          }).catch(err => console.error("Failed to register connection with backend:", err));
         };
         
         ws.onmessage = (event) => {
@@ -226,7 +231,8 @@ export default function App() {
         checkStatus();
         addToTerminal('sys', `Connected to device via ${protocol} (${baudRate} bps, Pins ${pins})`);
       }
-    });
+    })
+    .catch(err => console.error("Failed to connect device:", err));
   };
 
   const disconnectDevice = (id: string) => {
@@ -247,7 +253,8 @@ export default function App() {
           checkStatus();
           addToTerminal('sys', 'Disconnected device');
         }
-      });
+      })
+      .catch(err => console.error("Failed to disconnect device:", err));
   };
 
   const readDtcs = () => {
@@ -255,7 +262,8 @@ export default function App() {
       .then(res => res.json())
       .then(data => {
         if (data.dtcs) setDtcs(data.dtcs);
-      });
+      })
+      .catch(err => console.error("Failed to read DTCs:", err));
   };
 
   const clearDtcs = () => {
@@ -267,7 +275,8 @@ export default function App() {
           setExpandedDtc(null);
           addToTerminal('sys', 'DTCs cleared');
         }
-      });
+      })
+      .catch(err => console.error("Failed to clear DTCs:", err));
   };
 
   const toggleDtcDetails = (code: string) => {
@@ -342,7 +351,8 @@ export default function App() {
       } else {
         addToTerminal('sys', `Error: ${data.error}`);
       }
-    });
+    })
+    .catch(err => console.error("Failed to send terminal message:", err));
   };
 
   const readPcm = () => {
@@ -642,9 +652,29 @@ export default function App() {
                       <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
                         <div className="flex items-start">
                           <AlertTriangle className="w-5 h-5 mr-2 text-amber-600 flex-shrink-0 mt-0.5" />
-                          <div>
+                          <div className="flex-1">
                             <p className="font-semibold mb-1">Local Bridge Required</p>
                             <p className="mb-2">To use physical hardware, you must run the local bridge script on your Windows PC. The web app cannot directly access your USB ports.</p>
+                            
+                            <div className="bg-white/60 p-3 rounded-md border border-amber-200 mb-3">
+                              <h4 className="font-semibold text-xs uppercase tracking-wider mb-2 text-amber-700">Quick Setup</h4>
+                              <ol className="list-decimal list-inside space-y-1 text-xs text-amber-900">
+                                <li>Install <a href="https://www.python.org/downloads/" target="_blank" rel="noreferrer" className="underline font-medium hover:text-amber-700">Python 3.7+</a></li>
+                                <li>Open terminal and run: <code className="bg-amber-100 px-1 py-0.5 rounded">pip install websockets</code></li>
+                                <li>Download the bridge script below</li>
+                                <li>Run it: <code className="bg-amber-100 px-1 py-0.5 rounded">python j2534_bridge.py</code></li>
+                              </ol>
+                              <Button 
+                                variant="outline" 
+                                size="sm" 
+                                className="mt-3 bg-white border-amber-300 text-amber-700 hover:bg-amber-100"
+                                onClick={() => window.open('/api/bridge-script', '_blank')}
+                              >
+                                <Download className="w-4 h-4 mr-2" />
+                                Download Bridge Script
+                              </Button>
+                            </div>
+
                             <div className="flex items-center space-x-2">
                               <span className="font-mono bg-amber-100 px-2 py-1 rounded text-xs">ws://127.0.0.1:8080</span>
                               <span className={`px-2 py-1 rounded text-xs font-medium ${bridgeStatus === 'connected' ? 'bg-green-100 text-green-700' : bridgeStatus === 'connecting' ? 'bg-blue-100 text-blue-700' : 'bg-zinc-200 text-zinc-700'}`}>
