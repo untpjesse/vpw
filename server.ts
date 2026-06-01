@@ -88,6 +88,196 @@ if __name__ == "__main__":
     res.send(script);
   });
 
+  app.get("/api/bridge-script/cpp", (req, res) => {
+    const script = `// j2534_bridge.cpp
+// C++ Local Hardware Bridge for J2534
+// Requires: websocketpp, asio, nlohmann-json
+// Build Instructions (Windows / MSVC):
+//   1. Install vcpkg: https://vcpkg.io/en/
+//   2. vcpkg install websocketpp nlohmann-json
+//   3. cl /EHsc j2534_bridge.cpp /I vcpkg_installed\\x64-windows\\include
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <windows.h>
+
+#define ASIO_STANDALONE
+#include <websocketpp/config/asio_no_tls.hpp>
+#include <websocketpp/server.hpp>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+typedef websocketpp::server<websocketpp::config::asio> server;
+
+// J2534 Constants & Definitions
+#define STATUS_NOERROR 0
+#define PASS_FILTER 1
+
+typedef struct {
+    unsigned long ProtocolID;
+    unsigned long RxStatus;
+    unsigned long TxFlags;
+    unsigned long Timestamp;
+    unsigned long DataSize;
+    unsigned long ExtraDataIndex;
+    unsigned char Data[4128];
+} PASSTHRU_MSG;
+
+typedef long (WINAPI *PTOPEN)(void*, unsigned long*);
+typedef long (WINAPI *PTCLOSE)(unsigned long);
+typedef long (WINAPI *PTCONNECT)(unsigned long, unsigned long, unsigned long, unsigned long, unsigned long*);
+typedef long (WINAPI *PTDISCONNECT)(unsigned long);
+typedef long (WINAPI *PTREADMSGS)(unsigned long, PASSTHRU_MSG*, unsigned long*, unsigned long);
+typedef long (WINAPI *PTWRITEMSGS)(unsigned long, PASSTHRU_MSG*, unsigned long*, unsigned long);
+typedef long (WINAPI *PTSTARTMSGFILTER)(unsigned long, unsigned long, PASSTHRU_MSG*, PASSTHRU_MSG*, PASSTHRU_MSG*, unsigned long*);
+typedef long (WINAPI *PTSTOPMSGFILTER)(unsigned long, unsigned long);
+
+PTOPEN PassThruOpen = nullptr;
+PTCLOSE PassThruClose = nullptr;
+PTCONNECT PassThruConnect = nullptr;
+PTDISCONNECT PassThruDisconnect = nullptr;
+PTREADMSGS PassThruReadMsgs = nullptr;
+PTWRITEMSGS PassThruWriteMsgs = nullptr;
+PTSTARTMSGFILTER PassThruStartMsgFilter = nullptr;
+PTSTOPMSGFILTER PassThruStopMsgFilter = nullptr;
+
+unsigned long deviceId = 0;
+unsigned long channelId = 0;
+unsigned long filterId = 0;
+
+bool LoadJ2534DLL(const std::string& path) {
+    HMODULE hMod = LoadLibraryA(path.c_str());
+    if (!hMod) return false;
+    PassThruOpen = (PTOPEN)GetProcAddress(hMod, "PassThruOpen");
+    PassThruClose = (PTCLOSE)GetProcAddress(hMod, "PassThruClose");
+    PassThruConnect = (PTCONNECT)GetProcAddress(hMod, "PassThruConnect");
+    PassThruDisconnect = (PTDISCONNECT)GetProcAddress(hMod, "PassThruDisconnect");
+    PassThruReadMsgs = (PTREADMSGS)GetProcAddress(hMod, "PassThruReadMsgs");
+    PassThruWriteMsgs = (PTWRITEMSGS)GetProcAddress(hMod, "PassThruWriteMsgs");
+    PassThruStartMsgFilter = (PTSTARTMSGFILTER)GetProcAddress(hMod, "PassThruStartMsgFilter");
+    PassThruStopMsgFilter = (PTSTOPMSGFILTER)GetProcAddress(hMod, "PassThruStopMsgFilter");
+    return PassThruOpen != nullptr;
+}
+
+std::vector<unsigned char> HexToBytes(const std::string& hex) {
+    std::vector<unsigned char> bytes;
+    for (size_t i = 0; i < hex.length(); i += 2) {
+        if(hex[i] == ' ') { i--; continue; }
+        std::string byteString = hex.substr(i, 2);
+        unsigned char byte = (unsigned char)strtol(byteString.c_str(), nullptr, 16);
+        bytes.push_back(byte);
+    }
+    return bytes;
+}
+
+std::string BytesToHex(const unsigned char* data, unsigned long length) {
+    std::string hex;
+    char buf[4];
+    for (unsigned long i = 0; i < length; ++i) {
+        snprintf(buf, sizeof(buf), "%02X ", data[i]);
+        hex += buf;
+    }
+    if (!hex.empty()) hex.pop_back();
+    return hex;
+}
+
+void on_message(server* s, websocketpp::connection_hdl hdl, server::message_ptr msg) {
+    auto payload = msg->get_payload();
+    try {
+        json data = json::parse(payload);
+        std::string action = data.value("action", "");
+        
+        if (action == "connect") {
+            unsigned long protocol = 6; // ISO15765
+            if (data.value("protocol", "ISO15765") == "J1850PWM") protocol = 2; // PWM
+            unsigned long baud = std::stoul(data.value("baudRate", "500000"));
+
+            if (PassThruOpen) {
+                PassThruOpen(nullptr, &deviceId);
+                PassThruConnect(deviceId, protocol, 0, baud, &channelId);
+                
+                PASSTHRU_MSG mask = {0}; mask.ProtocolID = protocol; mask.DataSize = 4;
+                PASSTHRU_MSG pat = {0}; pat.ProtocolID = protocol; pat.DataSize = 4;
+                PassThruStartMsgFilter(channelId, PASS_FILTER, &mask, &pat, nullptr, &filterId);
+            }
+            json resp = {{"success", true}, {"action", "connect"}, {"message", "Connected via C++ Bridge"}};
+            s->send(hdl, resp.dump(), websocketpp::frame::opcode::text);
+        }
+        else if (action == "disconnect") {
+            if (PassThruDisconnect && channelId != 0) {
+                PassThruStopMsgFilter(channelId, filterId);
+                PassThruDisconnect(channelId);
+                PassThruClose(deviceId);
+                channelId = 0; deviceId = 0; filterId = 0;
+            }
+            json resp = {{"success", true}, {"action", "disconnect"}};
+            s->send(hdl, resp.dump(), websocketpp::frame::opcode::text);
+        }
+        else if (action == "send") {
+            std::string msgHex = data.value("message", "");
+            std::vector<unsigned char> txBytes = HexToBytes(msgHex);
+            
+            std::string rxHex = "NO DATA";
+            if (PassThruWriteMsgs && channelId != 0) {
+                PASSTHRU_MSG txMsg = {0};
+                txMsg.ProtocolID = 6;
+                txMsg.DataSize = txBytes.size();
+                memcpy(txMsg.Data, txBytes.data(), txBytes.size());
+                
+                unsigned long numMsgs = 1;
+                PassThruWriteMsgs(channelId, &txMsg, &numMsgs, 1000);
+                
+                PASSTHRU_MSG rxMsg = {0};
+                numMsgs = 1;
+                long status = PassThruReadMsgs(channelId, &rxMsg, &numMsgs, 1000);
+                if (status == STATUS_NOERROR && numMsgs > 0) {
+                    rxHex = BytesToHex(rxMsg.Data, rxMsg.DataSize);
+                }
+            } else {
+                rxHex = "41 00 BF 9F E9 91"; // Mock response
+            }
+
+            json resp = {{"success", true}, {"action", "send"}, {"sent", msgHex}, {"received", rxHex}};
+            s->send(hdl, resp.dump(), websocketpp::frame::opcode::text);
+        }
+    } catch (const std::exception& e) {
+        std::cout << "Error processing message: " << e.what() << std::endl;
+    }
+}
+
+int main() {
+    std::cout << "======================================\\n";
+    std::cout << " VCX Nano J2534 C++ WebSocket Bridge\\n";
+    std::cout << "======================================\\n";
+    
+    // Setup DLL Path (Common paths for VCX Nano / Tactrix / Mongoose)
+    if (LoadJ2534DLL("C:\\\\\\\\Program Files (x86)\\\\\\\\VCX\\\\\\\\VXDIAG\\\\\\\\J2534\\\\\\\\vxdiag.dll") || 
+        LoadJ2534DLL("C:\\\\\\\\Program Files (x86)\\\\\\\\OpenECU\\\\\\\\OpenPort 2.0\\\\\\\\op20pt32.dll")) {
+        std::cout << "[+] J2534 DLL Loaded Successfully.\\n";
+    } else {
+        std::cout << "[-] J2534 DLL Not Found. Bridge will run in simulation mode.\\n";
+    }
+
+    server print_server;
+    print_server.set_access_channels(websocketpp::log::alevel::all);
+    print_server.clear_access_channels(websocketpp::log::alevel::frame_payload);
+    print_server.init_asio();
+    print_server.set_message_handler(bind(&on_message, &print_server, std::placeholders::_1, std::placeholders::_2));
+    
+    std::cout << "Starting WebSocket server on ws://127.0.0.1:8080...\\n";
+    print_server.listen(8080);
+    print_server.start_accept();
+    print_server.run();
+
+    return 0;
+}
+`;
+    res.setHeader('Content-Disposition', 'attachment; filename="j2534_bridge.cpp"');
+    res.setHeader('Content-Type', 'text/plain');
+    res.send(script);
+  });
+
   app.post("/api/devices", (req, res) => {
     const { name, connectionType, protocol } = req.body;
     if (!name || typeof name !== 'string' || !connectionType) return res.status(400).json({ error: "Missing name or connectionType" });
@@ -241,6 +431,32 @@ if __name__ == "__main__":
       }
       res.json({ success: true, ecus });
     }, 1500);
+  });
+
+  app.post("/api/vehicle-info", (req, res) => {
+    const activeDevice = devices.find(d => d.isConnected);
+    if (!activeDevice) return res.status(400).json({ error: "Not connected to a vehicle" });
+    
+    // Simulate diagnostic request delay for requesting VIN, CAL ID, etc.
+    setTimeout(() => {
+      let info = {};
+      if (activeDevice.protocol === 'J1850PWM') {
+        info = {
+          vin: "1FMCU9418XUA0" + Math.floor(1000 + Math.random() * 9000), // Randomize last 4 digits
+          ecuName: "Ford EEC-V PCM",
+          calId: "1L2U-14A618-BA",
+          protocol: "SAE J1850 PWM"
+        };
+      } else {
+        info = {
+          vin: "1HGCM82633A00" + Math.floor(1000 + Math.random() * 9000),
+          ecuName: "Generic CAN ECM",
+          calId: "09A7B32F",
+          protocol: "ISO 15765-4 (CAN)"
+        };
+      }
+      res.json({ success: true, info });
+    }, 1200);
   });
 
   app.get("/api/live-data", (req, res) => {

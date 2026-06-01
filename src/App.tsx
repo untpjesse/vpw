@@ -34,6 +34,8 @@ export default function App() {
   const [pcmFlashProgress, setPcmFlashProgress] = useState(0);
   const [showFlashConfirm, setShowFlashConfirm] = useState(false);
   const [flashComplete, setFlashComplete] = useState(false);
+  const [vehicleInfo, setVehicleInfo] = useState<{ vin?: string; ecuName?: string; calId?: string; protocol?: string } | null>(null);
+  const [isFetchingVehicleInfo, setIsFetchingVehicleInfo] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const bcmEepromInputRef = useRef<HTMLInputElement>(null);
   const bcmFlashInputRef = useRef<HTMLInputElement>(null);
@@ -46,6 +48,7 @@ export default function App() {
   const [terminalProtocol, setTerminalProtocol] = useState('ISO15765');
   const [connectionMode, setConnectionMode] = useState<'simulator' | 'local_bridge'>('simulator');
   const [bridgeStatus, setBridgeStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+  const [setupLang, setSetupLang] = useState<'python' | 'cpp'>('python');
   const wsRef = useRef<WebSocket | null>(null);
 
   const fetchDevices = () => {
@@ -53,25 +56,43 @@ export default function App() {
       .then(res => res.json())
       .then(data => {
         setDevices(data.devices);
+        
+        const lastDevice = localStorage.getItem('lastConnectedDevice');
+        const lastProtocol = localStorage.getItem('lastConnectedProtocol');
+        const lastBaudRate = localStorage.getItem('lastConnectedBaudRate');
+        const lastPins = localStorage.getItem('lastConnectedPins');
+
         // Initialize default protocols for new devices
         setDeviceProtocols(prev => {
           const protocols = { ...prev };
           data.devices.forEach((d: any) => {
-            protocols[d.id] = d.savedProtocol || 'ISO15765';
+            if (d.id === lastDevice && lastProtocol) {
+              protocols[d.id] = lastProtocol;
+            } else {
+              protocols[d.id] = d.savedProtocol || 'ISO15765';
+            }
           });
           return protocols;
         });
         setDeviceBaudRates(prev => {
           const rates = { ...prev };
           data.devices.forEach((d: any) => {
-            rates[d.id] = d.baudRate || '500000';
+            if (d.id === lastDevice && lastBaudRate) {
+              rates[d.id] = lastBaudRate;
+            } else {
+              rates[d.id] = d.baudRate || '500000';
+            }
           });
           return rates;
         });
         setDevicePins(prev => {
           const pins = { ...prev };
           data.devices.forEach((d: any) => {
-            pins[d.id] = d.pins || '6/14';
+            if (d.id === lastDevice && lastPins) {
+              pins[d.id] = lastPins;
+            } else {
+              pins[d.id] = d.pins || '6/14';
+            }
           });
           return pins;
         });
@@ -85,18 +106,24 @@ export default function App() {
 
     const lastDevice = localStorage.getItem('lastConnectedDevice');
     const lastProtocol = localStorage.getItem('lastConnectedProtocol');
+    const lastBaudRate = localStorage.getItem('lastConnectedBaudRate');
+    const lastPins = localStorage.getItem('lastConnectedPins');
+
     if (lastDevice && lastProtocol) {
+      const baudRate = lastBaudRate || '500000';
+      const pins = lastPins || '6/14';
+      
       fetch(`/api/devices/${lastDevice}/connect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ protocol: lastProtocol })
+        body: JSON.stringify({ protocol: lastProtocol, baudRate, pins })
       })
       .then(res => res.json())
       .then(data => {
         if (data.success) {
           fetchDevices();
           checkStatus();
-          setTerminalLog(prev => [...prev, { type: 'sys', msg: `Auto-connected to last known device via ${lastProtocol}` }]);
+          setTerminalLog(prev => [...prev, { type: 'sys', msg: `Auto-connected to last known device via ${lastProtocol} (${baudRate} bps, Pins ${pins})` }]);
         }
       })
       .catch(err => console.error("Failed to auto-connect:", err));
@@ -180,6 +207,10 @@ export default function App() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ protocol, baudRate, pins })
           }).then(() => {
+            localStorage.setItem('lastConnectedDevice', id);
+            localStorage.setItem('lastConnectedProtocol', protocol);
+            localStorage.setItem('lastConnectedBaudRate', baudRate);
+            localStorage.setItem('lastConnectedPins', pins);
             fetchDevices();
             checkStatus();
             addToTerminal('sys', `Connected to physical VCX Nano via bridge (${protocol})`);
@@ -227,6 +258,8 @@ export default function App() {
       if (data.success) {
         localStorage.setItem('lastConnectedDevice', id);
         localStorage.setItem('lastConnectedProtocol', protocol);
+        localStorage.setItem('lastConnectedBaudRate', baudRate);
+        localStorage.setItem('lastConnectedPins', pins);
         fetchDevices();
         checkStatus();
         addToTerminal('sys', `Connected to device via ${protocol} (${baudRate} bps, Pins ${pins})`);
@@ -249,6 +282,8 @@ export default function App() {
         if (data.success) {
           localStorage.removeItem('lastConnectedDevice');
           localStorage.removeItem('lastConnectedProtocol');
+          localStorage.removeItem('lastConnectedBaudRate');
+          localStorage.removeItem('lastConnectedPins');
           fetchDevices();
           checkStatus();
           addToTerminal('sys', 'Disconnected device');
@@ -319,6 +354,27 @@ export default function App() {
       })
       .finally(() => {
         setIsScanningEcus(false);
+      });
+  };
+
+  const fetchVehicleInfo = () => {
+    setIsFetchingVehicleInfo(true);
+    addToTerminal('sys', 'Initiating Vehicle Info (OBD-II Mode 9) Request...');
+    fetch('/api/vehicle-info', { method: 'POST' })
+      .then(res => res.json())
+      .then(data => {
+        if (data.success) {
+          setVehicleInfo(data.info);
+          addToTerminal('sys', `Vehicle Info Retrieved. VIN: ${data.info.vin || 'Unknown'}`);
+        } else {
+          addToTerminal('sys', `Failed to retrieve Vehicle Info: ${data.error}`);
+        }
+      })
+      .catch(err => {
+        addToTerminal('sys', `Vehicle Info error: ${err.message}`);
+      })
+      .finally(() => {
+        setIsFetchingVehicleInfo(false);
       });
   };
 
@@ -505,6 +561,13 @@ export default function App() {
             <span>Connection</span>
           </button>
           <button 
+            onClick={() => setActiveTab('vehicle-info')}
+            className={`w-full flex items-center space-x-3 px-3 py-2 rounded-md transition-colors ${activeTab === 'vehicle-info' ? 'bg-zinc-800 text-white' : 'hover:bg-zinc-800/50'}`}
+          >
+            <Car className="w-5 h-5" />
+            <span>Vehicle Info</span>
+          </button>
+          <button 
             onClick={() => setActiveTab('modules')}
             className={`w-full flex items-center space-x-3 px-3 py-2 rounded-md transition-colors ${activeTab === 'modules' ? 'bg-zinc-800 text-white' : 'hover:bg-zinc-800/50'}`}
           >
@@ -657,21 +720,39 @@ export default function App() {
                             <p className="mb-2">To use physical hardware, you must run the local bridge script on your Windows PC. The web app cannot directly access your USB ports.</p>
                             
                             <div className="bg-white/60 p-3 rounded-md border border-amber-200 mb-3">
-                              <h4 className="font-semibold text-xs uppercase tracking-wider mb-2 text-amber-700">Quick Setup</h4>
-                              <ol className="list-decimal list-inside space-y-1 text-xs text-amber-900">
-                                <li>Install <a href="https://www.python.org/downloads/" target="_blank" rel="noreferrer" className="underline font-medium hover:text-amber-700">Python 3.7+</a></li>
-                                <li>Open terminal and run: <code className="bg-amber-100 px-1 py-0.5 rounded">pip install websockets</code></li>
-                                <li>Download the bridge script below</li>
-                                <li>Run it: <code className="bg-amber-100 px-1 py-0.5 rounded">python j2534_bridge.py</code></li>
-                              </ol>
+                              <div className="flex justify-between items-center mb-2">
+                                <h4 className="font-semibold text-xs uppercase tracking-wider text-amber-700">Quick Setup</h4>
+                                <div className="flex space-x-1">
+                                  <button onClick={() => setSetupLang('python')} className={`px-2 py-0.5 text-xs rounded border ${setupLang === 'python' ? 'bg-amber-200 border-amber-300 font-bold' : 'bg-white border-amber-200 hover:bg-amber-50'}`}>Python</button>
+                                  <button onClick={() => setSetupLang('cpp')} className={`px-2 py-0.5 text-xs rounded border ${setupLang === 'cpp' ? 'bg-amber-200 border-amber-300 font-bold' : 'bg-white border-amber-200 hover:bg-amber-50'}`}>C++</button>
+                                </div>
+                              </div>
+                              
+                              {setupLang === 'python' ? (
+                                <ol className="list-decimal list-inside space-y-1 text-xs text-amber-900">
+                                  <li>Install <a href="https://www.python.org/downloads/" target="_blank" rel="noreferrer" className="underline font-medium hover:text-amber-700">Python 3.7+</a></li>
+                                  <li>Open terminal and run: <code className="bg-amber-100 px-1 py-0.5 rounded">pip install websockets</code></li>
+                                  <li>Download the bridge script below</li>
+                                  <li>Run it: <code className="bg-amber-100 px-1 py-0.5 rounded">python j2534_bridge.py</code></li>
+                                </ol>
+                              ) : (
+                                <ol className="list-decimal list-inside space-y-1 text-xs text-amber-900">
+                                  <li>Ensure you have Visual Studio C++ build tools installed</li>
+                                  <li>Install <a href="https://vcpkg.io/en/" target="_blank" rel="noreferrer" className="underline font-medium hover:text-amber-700">vcpkg</a> package manager</li>
+                                  <li>Install dependencies: <code className="bg-amber-100 px-1 py-0.5 rounded">vcpkg install websocketpp nlohmann-json</code></li>
+                                  <li>Download the <code>j2534_bridge.cpp</code> source code below</li>
+                                  <li>Compile and run it using the instructions in the file header</li>
+                                </ol>
+                              )}
+                              
                               <Button 
                                 variant="outline" 
                                 size="sm" 
-                                className="mt-3 bg-white border-amber-300 text-amber-700 hover:bg-amber-100"
-                                onClick={() => window.open('/api/bridge-script', '_blank')}
+                                className="mt-4 bg-white border-amber-300 text-amber-700 hover:bg-amber-100"
+                                onClick={() => window.open(setupLang === 'python' ? '/api/bridge-script' : '/api/bridge-script/cpp', '_blank')}
                               >
                                 <Download className="w-4 h-4 mr-2" />
-                                Download Bridge Script
+                                Download Bridge {setupLang === 'python' ? 'Script' : 'Source (C++)'}
                               </Button>
                             </div>
 
@@ -851,6 +932,87 @@ export default function App() {
                   </div>
                 </CardContent>
               </Card>
+            </div>
+          )}
+
+          {activeTab === 'vehicle-info' && (
+            <div className="space-y-6 max-w-4xl mx-auto">
+              <div className="flex justify-between items-center">
+                <div>
+                  <h2 className="text-lg font-medium">Vehicle Information</h2>
+                  <p className="text-sm text-zinc-500">Retrieve VIN, ECU details, and Calibration IDs via OBD-II Mode 9.</p>
+                </div>
+                <Button 
+                  onClick={fetchVehicleInfo} 
+                  disabled={!status.isConnected || isFetchingVehicleInfo}
+                  className="bg-blue-600 hover:bg-blue-700"
+                >
+                  <Search className="w-4 h-4 mr-2" />
+                  {isFetchingVehicleInfo ? 'Fetching...' : 'Fetch Info'}
+                </Button>
+              </div>
+
+              {!status.isConnected ? (
+                <div className="p-8 text-center bg-zinc-50 border border-dashed rounded-lg">
+                  <Car className="w-12 h-12 text-zinc-300 mx-auto mb-3" />
+                  <p className="text-zinc-500 font-medium">Not Connected to Vehicle</p>
+                  <p className="text-sm text-zinc-400 mt-1">Please connect to a vehicle interface on the Connection tab first.</p>
+                </div>
+              ) : vehicleInfo ? (
+                <div className="grid gap-6 md:grid-cols-2">
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="text-base flex items-center">
+                        <HardDrive className="w-4 h-4 mr-2 text-zinc-500" />
+                        Vehicle Identification
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                      <div>
+                        <Label className="text-xs text-zinc-500 uppercase">VIN</Label>
+                        <div className="font-mono text-lg mt-1 p-2 bg-zinc-50 border rounded-md">
+                          {vehicleInfo.vin || 'Not Available'}
+                        </div>
+                      </div>
+                      <div>
+                        <Label className="text-xs text-zinc-500 uppercase">Primary Protocol</Label>
+                        <div className="font-mono text-sm mt-1 p-2 bg-zinc-50 border rounded-md">
+                          {vehicleInfo.protocol || status.activeProtocol}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="text-base flex items-center">
+                        <Cpu className="w-4 h-4 mr-2 text-zinc-500" />
+                        ECU Details
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                      <div>
+                        <Label className="text-xs text-zinc-500 uppercase">ECU Name / Type</Label>
+                        <div className="font-mono text-sm mt-1 p-2 bg-zinc-50 border rounded-md">
+                          {vehicleInfo.ecuName || 'Unknown Module'}
+                        </div>
+                      </div>
+                      <div>
+                        <Label className="text-xs text-zinc-500 uppercase">Calibration ID (CALID)</Label>
+                        <div className="font-mono text-sm mt-1 p-2 bg-zinc-50 border rounded-md">
+                          {vehicleInfo.calId || 'Not Available'}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+              ) : (
+                <div className="p-8 text-center bg-zinc-50 border border-dashed rounded-lg">
+                  <Car className="w-12 h-12 text-zinc-300 mx-auto mb-3" />
+                  <p className="text-zinc-500 font-medium">No Vehicle Info Retrieved</p>
+                  <p className="text-sm text-zinc-400 mt-1">Click the button above to request Mode 9 information from the vehicle.</p>
+                </div>
+              )}
             </div>
           )}
 
